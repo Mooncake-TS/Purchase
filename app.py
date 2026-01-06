@@ -193,11 +193,16 @@ if run:
             st.warning("실패한 SKU 목록(원인 포함)")
             st.dataframe(out_err, use_container_width=True)
 
-    st.subheader("📊 예측 판매량 분포(히스토그램)")
-    fig = plt.figure()
-    plt.hist(out_ok["forecast_sales_qty"].astype(float), bins=12)
-    plt.xlabel("forecast_sales_qty")
-    plt.ylabel("count")
+   st.subheader("📊 SKU별 예측 판매량")
+
+    fig = plt.figure(figsize=(12, 5))
+    plt.bar(out_ok["sku"], out_ok["forecast_sales_qty"])
+    plt.xlabel("SKU")
+    plt.ylabel("Forecast Sales Qty")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
     st.pyplot(fig)
 
+
     st.info(f"📌 선택 월: {target_ym} / 전체 SKU 예측 완료")
+
