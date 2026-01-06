@@ -245,6 +245,50 @@ if run:
     plt.tight_layout()
     st.pyplot(fig)
 
+    # =========================
+# 🔎 특정 SKU 1년치 월별 판매량 그래프 추가
+# =========================
+st.subheader("🗓️ 특정 SKU 1년치 월별 판매량(실제)")
+
+# SKU 선택 (기본값: 예측 Top1 SKU)
+default_sku_for_trend = out_ok.iloc[0]["sku"] if len(out_ok) > 0 else skus[0]
+trend_sku = st.selectbox("추세를 보고 싶은 SKU 선택", options=skus, index=skus.index(default_sku_for_trend))
+
+# 기준 월 선택 (기본값: 예측 대상월의 직전월)
+try:
+    target_dt = pd.to_datetime(target_ym + "-01")
+except Exception:
+    target_dt = pd.to_datetime(default_target + "-01")
+
+end_month = (target_dt - pd.offsets.MonthBegin(1))  # 예측월 직전월까지를 '최근 1년' 기준점으로
+start_month = end_month - pd.DateOffset(months=11)
+
+series_trend = make_monthly_series(df, trend_sku)
+
+# 1년 구간 슬라이싱
+trend_1y = series_trend.loc[start_month:end_month]
+
+# 혹시 데이터가 더 짧으면 가능한 구간만 표시
+if len(trend_1y) == 0:
+    st.warning("선택한 SKU의 1년치 데이터를 찾을 수 없어. month 범위를 확인해줘.")
+else:
+    st.caption(f"표시 구간: {start_month.strftime('%Y-%m')} ~ {end_month.strftime('%Y-%m')} (총 {len(trend_1y)}개월)")
+
+    fig_trend = plt.figure(figsize=(14, 4))
+    plt.plot(trend_1y.index, trend_1y.values, marker="o")
+    plt.xlabel("Month")
+    plt.ylabel("Sales Qty")
+    plt.title(f"{trend_sku} - Last 12 Months Sales Trend")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    st.pyplot(fig_trend)
+
+    # 간단 요약(최고/최저월)
+    max_m = trend_1y.idxmax().strftime("%Y-%m")
+    min_m = trend_1y.idxmin().strftime("%Y-%m")
+    st.info(f"📌 1년 최고 판매월: **{max_m} ({int(trend_1y.max())})** / 최저 판매월: **{min_m} ({int(trend_1y.min())})**")
+
+
     # 다운로드
     st.subheader("⬇️ 결과 다운로드")
     csv = out_ok.to_csv(index=False).encode("utf-8-sig")
@@ -260,3 +304,4 @@ if run:
             st.dataframe(out_err, use_container_width=True)
 
     st.success(f"완료! 선택 월: {target_ym}")
+
