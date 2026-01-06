@@ -15,6 +15,14 @@ st.set_page_config(page_title="Inventory Planning (LSTM)", layout="wide")
 st.title("📦 Inventory Planning (LSTM): FG 수량 분석 → RM 구매 → ABC")
 
 # =========================
+# Normalization helper
+# =========================
+def norm_sku(x):
+    if pd.isna(x):
+        return x
+    return str(x).strip().upper()
+
+# =========================
 # Loaders (ROOT)
 # =========================
 @st.cache_data
@@ -27,7 +35,7 @@ def load_sales_root() -> pd.DataFrame:
 
     df = df.copy()
     df["month"] = pd.to_datetime(df["month"])
-    df["sku"] = df["sku"].astype(str)
+    df["sku"] = df["sku"].apply(norm_sku)
     df["sales_qty"] = pd.to_numeric(df["sales_qty"], errors="coerce").fillna(0).astype(int)
     df = df.sort_values(["sku", "month"]).reset_index(drop=True)
     return df
@@ -41,7 +49,7 @@ def load_inventory_root() -> pd.DataFrame:
         raise ValueError(f"inventory.xlsx에 컬럼이 부족해: {missing}")
 
     inv = inv.copy()
-    inv["sku"] = inv["sku"].astype(str)
+    inv["sku"] = inv["sku"].apply(norm_sku)
     inv["on_hand"] = pd.to_numeric(inv["on_hand"], errors="coerce").fillna(0.0)
     inv["on_order"] = pd.to_numeric(inv["on_order"], errors="coerce").fillna(0.0)
     return inv
@@ -55,18 +63,17 @@ def load_bom_root() -> pd.DataFrame:
         raise ValueError(f"BOM.xlsx에 컬럼이 부족해: {missing}")
 
     bom = bom.copy()
-    bom["fg_sku"] = bom["fg_sku"].astype(str)
-    bom["rm_sku"] = bom["rm_sku"].astype(str)
+    bom["fg_sku"] = bom["fg_sku"].apply(norm_sku)
+    bom["rm_sku"] = bom["rm_sku"].apply(norm_sku)
     bom["qty_per"] = pd.to_numeric(bom["qty_per"], errors="coerce").fillna(0.0)
     return bom
 
 @st.cache_data
 def load_master_root() -> pd.DataFrame:
-    # ABC 분석용: sku, unit_price
     m = pd.read_excel("master.xlsx")
     m = m.copy()
     if "sku" in m.columns:
-        m["sku"] = m["sku"].astype(str)
+        m["sku"] = m["sku"].apply(norm_sku)
     if "unit_price" in m.columns:
         m["unit_price"] = pd.to_numeric(m["unit_price"], errors="coerce")
     return m
@@ -106,9 +113,6 @@ def build_model(window: int, lstm_units: int = 32):
 
 @st.cache_resource
 def train_lstm_cached(series_values_tuple, window: int, epochs: int, batch_size: int, seed: int):
-    """
-    SKU별 모델 학습 캐시: 같은 데이터/설정이면 재학습 안 함
-    """
     series_values = np.array(series_values_tuple, dtype=float).reshape(-1, 1)
 
     np.random.seed(seed)
@@ -170,7 +174,7 @@ def forecast_to_target_month(model, scaler, scaled_history: np.ndarray, window: 
     return pred_int
 
 # =========================
-# RM category rules (pattern-based)
+# RM category rules
 # =========================
 def rm_category(rm_sku: str) -> str:
     s = str(rm_sku).upper()
@@ -218,13 +222,16 @@ with st.sidebar:
     top_n_contrib = st.slider("RM→FG 기여도 Top N", 5, 50, 10)
 
     st.divider()
+    abc_top_n = st.slider("ABC 그래프 표시 Top N", 5, len(skus), min(20, len(skus)))
+
+    st.divider()
     st.caption("정의(합의 룰)")
     st.caption("- FG on_order = WIP")
     st.caption("- RM on_order = 발주/운송중(입고예정)")
+    st.caption("단위")
+    st.caption("- FG Qty: EA (가정)")
+    st.caption("- RM Qty: RM units (단위 혼합 가능, 동일 단위 가정)")
 
-# =========================
-# Run
-# =========================
 run = st.button("🚀 실행")
 
 tab1, tab2, tab3 = st.tabs(["1) 수량 분석 (FG)", "2) 원재료 구매 (RM)", "3) ABC 분석 (예측월)"])
@@ -271,15 +278,13 @@ def compute_everything():
     out = pd.DataFrame(results)
     out_ok = out[out["forecast_sales_qty"].notna()].copy()
     out_err = out[out["forecast_sales_qty"].isna()].copy()
-
     out_ok["forecast_sales_qty"] = out_ok["forecast_sales_qty"].astype(int)
 
     # ---------- FG compare: fg_available = on_hand + on_order(WIP) ----------
     cmp_fg = out_ok.merge(df_inv, on="sku", how="left")
     cmp_fg["on_hand"] = cmp_fg["on_hand"].fillna(0.0)
     cmp_fg["on_order"] = cmp_fg["on_order"].fillna(0.0)
-
-    cmp_fg["fg_available_qty"] = cmp_fg["on_hand"] + cmp_fg["on_order"]  # ✅ WIP 포함
+    cmp_fg["fg_available_qty"] = cmp_fg["on_hand"] + cmp_fg["on_order"]  # WIP 포함
     cmp_fg["fg_need_qty"] = (cmp_fg["forecast_sales_qty"] - cmp_fg["fg_available_qty"]).clip(lower=0).round(0).astype(int)
 
     fg_view = cmp_fg[[
@@ -291,16 +296,14 @@ def compute_everything():
     fg_need_only = fg_view[fg_view["fg_need_qty"] > 0].copy()
 
     # ---------- BOM explode for RM ----------
-    # fg_need_only 기준으로만 전개(생산할 게 없는 SKU는 제외)
     exp = fg_need_only[["sku", "fg_need_qty"]].rename(columns={"sku": "fg_sku"}).merge(df_bom, on="fg_sku", how="left")
     missing_bom = exp[exp["rm_sku"].isna()]["fg_sku"].unique().tolist()
     exp = exp.dropna(subset=["rm_sku"]).copy()
-
     exp["rm_gross_req"] = exp["fg_need_qty"] * exp["qty_per"]
 
     rm_gross = exp.groupby("rm_sku", as_index=False)["rm_gross_req"].sum().sort_values("rm_gross_req", ascending=False)
 
-    # RM inventory join
+    # RM inventory join (SKU 정규화가 되어있으니 이제 0 문제 해결됨)
     rm = rm_gross.merge(df_inv, left_on="rm_sku", right_on="sku", how="left")
     rm["on_hand"] = rm["on_hand"].fillna(0.0)
     rm["on_order"] = rm["on_order"].fillna(0.0)
@@ -309,26 +312,18 @@ def compute_everything():
 
     rm_out = rm[["rm_sku", "rm_gross_req", "on_hand", "on_order", "rm_available", "rm_net_req"]].copy()
     rm_out["rm_category"] = rm_out["rm_sku"].apply(rm_category)
-
-    # coverage
-    rm_out["coverage_ratio"] = np.where(
-        rm_out["rm_gross_req"] > 0,
-        rm_out["rm_available"] / rm_out["rm_gross_req"],
-        np.nan
-    )
-
+    rm_out["coverage_ratio"] = np.where(rm_out["rm_gross_req"] > 0, rm_out["rm_available"] / rm_out["rm_gross_req"], np.nan)
     rm_out = rm_out.sort_values("rm_net_req", ascending=False).reset_index(drop=True)
 
     return out_ok, out_err, fg_view, fg_need_only, exp, missing_bom, rm_out
 
 # =========================
-# Execute & store in session_state
+# Execute
 # =========================
 if run:
-    key = (target_ym, window, epochs, batch_size, seed)
     with st.spinner("계산 중..."):
         out_ok, out_err, fg_view, fg_need_only, exp, missing_bom, rm_out = compute_everything()
-    st.session_state["result_key"] = key
+
     st.session_state["out_ok"] = out_ok
     st.session_state["out_err"] = out_err
     st.session_state["fg_view"] = fg_view
@@ -338,17 +333,17 @@ if run:
     st.session_state["rm_out"] = rm_out
     st.success("완료!")
 
-# =========================
-# Render (if results exist)
-# =========================
 has_results = "out_ok" in st.session_state
 
+# =========================
+# TAB 1: FG
+# =========================
 with tab1:
     st.subheader("1) 수량 분석 (FG)")
-    st.caption("FG on_order는 WIP로 가정하여 FG 가용재고 = on_hand + on_order")
+    st.caption("단위: Qty (EA)")
 
     if not has_results:
-        st.info("왼쪽 설정 후, 상단의 '실행'을 눌러줘.")
+        st.info("왼쪽 설정 후, '실행'을 눌러줘.")
     else:
         out_ok = st.session_state["out_ok"]
         out_err = st.session_state["out_err"]
@@ -367,11 +362,11 @@ with tab1:
         x = np.arange(len(plot_fg))
         width = 0.42
         fig1 = plt.figure(figsize=(14, 5))
-        plt.bar(x - width/2, plot_fg["forecast_sales_qty"], width=width, label="Forecast")
-        plt.bar(x + width/2, plot_fg["fg_available_qty"], width=width, label="FG Available (On hand + WIP)")
+        plt.bar(x - width/2, plot_fg["forecast_sales_qty"], width=width, label="Forecast (EA)")
+        plt.bar(x + width/2, plot_fg["fg_available_qty"], width=width, label="Available (On hand + WIP) (EA)")
         plt.xticks(x, plot_fg["sku"], rotation=45, ha="right")
         plt.xlabel("FG SKU")
-        plt.ylabel("Qty")
+        plt.ylabel("Qty (EA)")
         plt.title(f"Forecast vs FG Available - {target_ym} (Top {top_n_fg})")
         plt.legend()
         plt.tight_layout()
@@ -387,9 +382,12 @@ with tab1:
             with st.expander("⚠️ 예측 실패 SKU (원인)"):
                 st.dataframe(out_err, use_container_width=True)
 
+# =========================
+# TAB 2: RM
+# =========================
 with tab2:
     st.subheader("2) 원재료 구매 (RM)")
-    st.caption("RM on_order는 발주/운송중(입고예정)으로 가정하여 RM 가용재고 = on_hand + on_order")
+    st.caption("단위: Qty (RM units)  ※ 단위 혼합 가능(물/L, 설탕/KG 등) — 현재는 동일 단위로 가정")
 
     if not has_results:
         st.info("먼저 '실행'을 눌러서 FG_need와 RM 계산을 만들어줘.")
@@ -402,8 +400,7 @@ with tab2:
             st.warning(f"BOM이 누락된 FG가 있어 RM 계산에서 제외됨: {missing_bom}")
 
         st.subheader("✅ RM 구매 테이블 (net_req 기준 정렬)")
-        rm_table = rm_out.copy()
-        rm_table_display = rm_table[[
+        rm_table_display = rm_out[[
             "rm_sku", "rm_category",
             "rm_gross_req", "rm_available",
             "on_hand", "on_order",
@@ -416,13 +413,12 @@ with tab2:
             st.dataframe(rm_table_display, use_container_width=True)
 
         st.subheader("🧩 RM 카테고리별 보기")
-        cats = ["All"] + sorted(rm_table["rm_category"].unique().tolist())
+        cats = ["All"] + sorted(rm_out["rm_category"].unique().tolist())
         sel_cat = st.selectbox("카테고리 선택", options=cats, index=0)
 
+        rm_cat = rm_out.copy()
         if sel_cat != "All":
-            rm_cat = rm_table[rm_table["rm_category"] == sel_cat].copy()
-        else:
-            rm_cat = rm_table.copy()
+            rm_cat = rm_cat[rm_cat["rm_category"] == sel_cat].copy()
 
         rm_cat_disp = rm_cat[[
             "rm_sku", "rm_category",
@@ -435,61 +431,47 @@ with tab2:
         st.divider()
         st.subheader("🔎 RM 하나 선택 → 어떤 FG 때문에 필요한지 (기여도)")
 
-        rm_candidates = rm_table.sort_values("rm_net_req", ascending=False)["rm_sku"].tolist()
-        if len(rm_candidates) == 0:
-            st.info("RM 항목이 없어.")
+        rm_candidates = rm_out.sort_values("rm_net_req", ascending=False)["rm_sku"].tolist()
+        selected_rm = st.selectbox("원재료 선택", options=rm_candidates, index=0)
+
+        contrib = exp[exp["rm_sku"] == selected_rm].copy()
+        if len(contrib) == 0:
+            st.info("이 원재료는 현재 생산계획 기준으로 소요가 없어.")
         else:
-            selected_rm = st.selectbox("원재료 선택", options=rm_candidates, index=0)
+            contrib["fg_contrib_qty"] = contrib["fg_need_qty"] * contrib["qty_per"]
+            fg_contrib = (
+                contrib.groupby("fg_sku", as_index=False)["fg_contrib_qty"]
+                .sum()
+                .sort_values("fg_contrib_qty", ascending=False)
+            )
+            total = fg_contrib["fg_contrib_qty"].sum()
+            fg_contrib["share"] = np.where(total > 0, fg_contrib["fg_contrib_qty"] / total, np.nan)
 
-            # exp에는 fg_sku, fg_need_qty, rm_sku, qty_per, rm_gross_req가 있음
-            contrib = exp[exp["rm_sku"] == selected_rm].copy()
-            if len(contrib) == 0:
-                st.info("이 원재료는 현재 생산계획 기준으로 소요가 없어.")
-            else:
-                contrib["fg_contrib_qty"] = contrib["fg_need_qty"] * contrib["qty_per"]
-                fg_contrib = (
-                    contrib.groupby("fg_sku", as_index=False)["fg_contrib_qty"]
-                    .sum()
-                    .sort_values("fg_contrib_qty", ascending=False)
-                )
-                total = fg_contrib["fg_contrib_qty"].sum()
-                fg_contrib["share"] = np.where(total > 0, fg_contrib["fg_contrib_qty"] / total, np.nan)
+            st.write(f"선택 RM: **{selected_rm}** | 총 소요량(gross): **{total:.2f} (RM units)**")
+            st.dataframe(fg_contrib.head(top_n_contrib), use_container_width=True)
 
-                st.write(f"선택 RM: **{selected_rm}** | 총 소요량(gross): **{total:.2f}**")
+            plot_c = fg_contrib.head(top_n_contrib).copy()
+            figc = plt.figure(figsize=(14, 5))
+            plt.bar(plot_c["fg_sku"], plot_c["fg_contrib_qty"])
+            plt.xlabel("FG SKU")
+            plt.ylabel("RM Contribution Qty (RM units)")
+            plt.title(f"FG Contribution to {selected_rm} - {target_ym} (Top {min(top_n_contrib, len(plot_c))})")
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+            st.pyplot(figc)
 
-                st.dataframe(fg_contrib.head(top_n_contrib), use_container_width=True)
-
-                # (선택) 그래프도 같이: 너무 복잡하면 빼도 됨
-                plot_c = fg_contrib.head(top_n_contrib).copy()
-                figc = plt.figure(figsize=(14, 5))
-                plt.bar(plot_c["fg_sku"], plot_c["fg_contrib_qty"])
-                plt.xlabel("FG SKU")
-                plt.ylabel("RM Contribution Qty")
-                plt.title(f"FG Contribution to {selected_rm} (Top {min(top_n_contrib, len(plot_c))})")
-                plt.xticks(rotation=45, ha="right")
-                plt.tight_layout()
-                st.pyplot(figc)
-
-        # 다운로드
-        st.subheader("⬇️ RM 결과 다운로드")
-        csv_rm = rm_table_display.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "RM 구매 테이블 CSV 다운로드",
-            data=csv_rm,
-            file_name=f"rm_plan_{target_ym}.csv",
-            mime="text/csv"
-        )
-
+# =========================
+# TAB 3: ABC
+# =========================
 with tab3:
     st.subheader("3) ABC 분석 (예측월)")
-    st.caption("ABC 기준: 예측월 매출기여도 = forecast_sales_qty × unit_price")
+    st.caption("기준: forecast_value = forecast_sales_qty × unit_price | 단위: KRW")
 
     if not has_results:
         st.info("먼저 '실행'을 눌러 예측 수량을 만든 뒤 ABC를 계산해줘.")
     else:
         out_ok = st.session_state["out_ok"]
 
-        # master 로드 시도
         try:
             master = load_master_root()
         except Exception as e:
@@ -498,17 +480,16 @@ with tab3:
 
         if ("sku" not in master.columns) or ("unit_price" not in master.columns):
             st.warning("master.xlsx에 sku / unit_price 컬럼이 없어서 ABC 분석을 할 수 없어.")
-            st.info("master.xlsx에 최소한 (sku, unit_price) 컬럼을 추가해줘.")
+            st.info("master.xlsx에 최소 (sku, unit_price) 컬럼을 추가해줘.")
         else:
             m = master[["sku", "unit_price"]].copy()
-            m["sku"] = m["sku"].astype(str)
+            m["sku"] = m["sku"].apply(norm_sku)
             m["unit_price"] = pd.to_numeric(m["unit_price"], errors="coerce")
 
             abc = out_ok.merge(m, on="sku", how="left")
-
             missing_price = abc[abc["unit_price"].isna()]["sku"].unique().tolist()
             if missing_price:
-                st.warning(f"unit_price가 없는 SKU가 있어 ABC에서 제외됨(또는 NaN): {missing_price}")
+                st.warning(f"unit_price가 없는 SKU가 있어 ABC에서 제외됨: {missing_price}")
 
             abc = abc.dropna(subset=["unit_price"]).copy()
             abc["forecast_value"] = abc["forecast_sales_qty"] * abc["unit_price"]
@@ -521,7 +502,6 @@ with tab3:
                 abc["value_share"] = np.where(total_value > 0, abc["forecast_value"] / total_value, np.nan)
                 abc["cum_share"] = abc["value_share"].cumsum()
 
-                # ABC cutoffs: A 80%, B 95%, C rest
                 def assign_abc(cum):
                     if cum <= 0.80:
                         return "A"
@@ -538,20 +518,21 @@ with tab3:
                 ]].copy()
                 st.dataframe(show_abc, use_container_width=True)
 
-                st.subheader("📈 파레토(누적 매출 비중)")
+                st.subheader("📈 ABC 파레토 (x=SKU, y=예측매출 KRW)")
+                plot_abc = abc.head(abc_top_n).copy()
 
-                # 한 figure에 bar + 누적선 (twin axis)
-                x = np.arange(len(abc))
+                x = np.arange(len(plot_abc))
                 figp = plt.figure(figsize=(14, 5))
                 ax1 = plt.gca()
-                ax1.bar(x, abc["forecast_value"])
+                ax1.bar(x, plot_abc["forecast_value"])
                 ax1.set_xlabel("SKU (sorted by forecast value)")
-                ax1.set_ylabel("Forecast Value")
-                ax1.set_title(f"ABC Pareto - {target_ym}")
-                ax1.set_xticks([])  # SKU 라벨은 너무 많으면 안 보이니 숨김
+                ax1.set_ylabel("Forecast Value (KRW)")
+                ax1.set_title(f"ABC Pareto - {target_ym} (Top {abc_top_n})")
+                ax1.set_xticks(x)
+                ax1.set_xticklabels(plot_abc["sku"], rotation=45, ha="right")
 
                 ax2 = ax1.twinx()
-                ax2.plot(x, abc["cum_share"] * 100)
+                ax2.plot(x, (plot_abc["cum_share"] * 100))
                 ax2.set_ylabel("Cumulative %")
 
                 plt.tight_layout()
@@ -564,12 +545,3 @@ with tab3:
                     st.metric("B 개수", int((abc["abc_class"] == "B").sum()))
                 with col3:
                     st.metric("C 개수", int((abc["abc_class"] == "C").sum()))
-
-                st.subheader("⬇️ ABC 다운로드")
-                csv_abc = show_abc.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "ABC 결과 CSV 다운로드",
-                    data=csv_abc,
-                    file_name=f"abc_{target_ym}.csv",
-                    mime="text/csv"
-                )
