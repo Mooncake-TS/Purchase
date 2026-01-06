@@ -122,7 +122,7 @@ st.title("📈 Monthly Sales Forecast (LSTM)")
 with st.sidebar:
     st.header("설정")
 
-    data_path = st.text_input("sales.xlsx 경로", value="data/sales.xlsx")
+    data_path = st.text_input("sales.xlsx 경로", value="sales.xlsx")
     window = st.slider("입력 윈도우(개월)", min_value=3, max_value=24, value=12, step=1)
     epochs = st.slider("학습 epochs", min_value=50, max_value=500, value=300, step=50)
     batch_size = st.selectbox("batch_size", options=[4, 8, 16, 32], index=1)
@@ -201,3 +201,4 @@ if run:
 
     except Exception as e:
         st.error(f"실행 실패: {e}")
+
