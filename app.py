@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 # Page
 # =========================
 st.set_page_config(page_title="Inventory Planning (LSTM)", layout="wide")
-st.title("📦 Inventory Planning (LSTM): FG 수량 분석 → RM 구매 → ABC")
+st.title("📦 자재소요계획(with LSTM): 필요 재고 분석 → RM 소요계획 → ABC 분석을 통한 구매 우선 순위")
 
 # =========================
 # Formatting helpers (display-only)
@@ -619,3 +619,4 @@ with tab3:
                     st.metric("B 개수", int((abc["abc_class"] == "B").sum()))
                 with col3:
                     st.metric("C 개수", int((abc["abc_class"] == "C").sum()))
+
