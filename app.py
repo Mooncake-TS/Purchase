@@ -385,10 +385,10 @@ has_results = "out_ok" in st.session_state
 # TAB 1: FG
 # =========================
 with tab1:
-    st.subheader("1) 수량 분석 (FG)")
+    st.subheader("1) 수량 분석 (Finished Goods)")
 
     if not has_results:
-        st.info("왼쪽 설정 후, '실행'을 눌러줘.")
+        st.info("왼쪽 설정 후, '실행'을 눌러주세요.")
     else:
         out_ok = st.session_state["out_ok"]
         out_err = st.session_state["out_err"]
@@ -619,4 +619,5 @@ with tab3:
                     st.metric("B 개수", int((abc["abc_class"] == "B").sum()))
                 with col3:
                     st.metric("C 개수", int((abc["abc_class"] == "C").sum()))
+
 
