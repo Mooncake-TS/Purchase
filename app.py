@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -15,12 +16,61 @@ st.set_page_config(page_title="Inventory Planning (LSTM)", layout="wide")
 st.title("📦 Inventory Planning (LSTM): FG 수량 분석 → RM 구매 → ABC")
 
 # =========================
-# Normalization helper
+# Formatting helpers (display-only)
+# =========================
+def fmt_int_commas(x):
+    if pd.isna(x):
+        return x
+    try:
+        return f"{int(round(float(x))):,}"
+    except Exception:
+        return x
+
+def fmt_float_commas(x, decimals=2):
+    if pd.isna(x):
+        return x
+    try:
+        return f"{float(x):,.{decimals}f}"
+    except Exception:
+        return x
+
+def fmt_percent(x, decimals=1):
+    if pd.isna(x):
+        return x
+    try:
+        return f"{float(x) * 100:.{decimals}f}%"
+    except Exception:
+        return x
+
+def df_with_commas(df: pd.DataFrame, int_cols=None, float_cols=None, pct_cols=None,
+                   float_decimals=2, pct_decimals=1):
+    """Return display-only dataframe with formatted numeric columns."""
+    d = df.copy()
+    int_cols = int_cols or []
+    float_cols = float_cols or []
+    pct_cols = pct_cols or []
+    for c in int_cols:
+        if c in d.columns:
+            d[c] = d[c].apply(fmt_int_commas)
+    for c in float_cols:
+        if c in d.columns:
+            d[c] = d[c].apply(lambda v: fmt_float_commas(v, decimals=float_decimals))
+    for c in pct_cols:
+        if c in d.columns:
+            d[c] = d[c].apply(lambda v: fmt_percent(v, decimals=pct_decimals))
+    return d
+
+# =========================
+# Normalization helper (handles NBSP etc.)
 # =========================
 def norm_sku(x):
     if pd.isna(x):
         return x
-    return str(x).strip().upper()
+    s = str(x)
+    s = s.replace("\u00A0", " ")          # NBSP -> normal space
+    s = re.sub(r"\s+", " ", s)            # collapse whitespace
+    s = s.strip().upper()
+    return s
 
 # =========================
 # Loaders (ROOT)
@@ -225,12 +275,8 @@ with st.sidebar:
     abc_top_n = st.slider("ABC 그래프 표시 Top N", 5, len(skus), min(20, len(skus)))
 
     st.divider()
-    st.caption("정의(합의 룰)")
-    st.caption("- FG on_order = WIP")
-    st.caption("- RM on_order = 발주/운송중(입고예정)")
-    st.caption("단위")
-    st.caption("- FG Qty: EA (가정)")
-    st.caption("- RM Qty: RM units (단위 혼합 가능, 동일 단위 가정)")
+    st.caption("표시 포맷")
+    st.caption("- 테이블 숫자: 천 단위 콤마(,)")
 
 run = st.button("🚀 실행")
 
@@ -303,7 +349,7 @@ def compute_everything():
 
     rm_gross = exp.groupby("rm_sku", as_index=False)["rm_gross_req"].sum().sort_values("rm_gross_req", ascending=False)
 
-    # RM inventory join (SKU 정규화가 되어있으니 이제 0 문제 해결됨)
+    # RM inventory join
     rm = rm_gross.merge(df_inv, left_on="rm_sku", right_on="sku", how="left")
     rm["on_hand"] = rm["on_hand"].fillna(0.0)
     rm["on_order"] = rm["on_order"].fillna(0.0)
@@ -340,7 +386,6 @@ has_results = "out_ok" in st.session_state
 # =========================
 with tab1:
     st.subheader("1) 수량 분석 (FG)")
-    st.caption("단위: Qty (EA)")
 
     if not has_results:
         st.info("왼쪽 설정 후, '실행'을 눌러줘.")
@@ -351,10 +396,15 @@ with tab1:
         fg_need_only = st.session_state["fg_need_only"]
 
         st.subheader("✅ 예측 결과 (전체 SKU)")
-        st.dataframe(out_ok.sort_values("forecast_sales_qty", ascending=False), use_container_width=True)
+        out_ok_disp = df_with_commas(out_ok, int_cols=["forecast_sales_qty"])
+        st.dataframe(out_ok_disp.sort_values("forecast_sales_qty", ascending=False), use_container_width=True)
 
         st.subheader("🏭 예측 vs (재고+WIP) → 생산 필요량")
-        st.dataframe(fg_view, use_container_width=True)
+        fg_view_disp = df_with_commas(
+            fg_view,
+            int_cols=["forecast_sales_qty", "on_hand", "on_order", "fg_available_qty", "fg_need_qty"]
+        )
+        st.dataframe(fg_view_disp, use_container_width=True)
 
         st.subheader("📊 FG: 예측 vs 가용재고(재고+WIP) (Top N)")
         plot_fg = fg_view.sort_values("forecast_sales_qty", ascending=False).head(top_n_fg).copy()
@@ -376,7 +426,11 @@ with tab1:
         if len(fg_need_only) == 0:
             st.success("🎉 생산 필요 SKU가 없어! (예측 대비 재고+WIP가 충분)")
         else:
-            st.dataframe(fg_need_only, use_container_width=True)
+            fg_need_only_disp = df_with_commas(
+                fg_need_only,
+                int_cols=["forecast_sales_qty", "on_hand", "on_order", "fg_available_qty", "fg_need_qty"]
+            )
+            st.dataframe(fg_need_only_disp, use_container_width=True)
 
         if len(out_err) > 0:
             with st.expander("⚠️ 예측 실패 SKU (원인)"):
@@ -387,7 +441,6 @@ with tab1:
 # =========================
 with tab2:
     st.subheader("2) 원재료 구매 (RM)")
-    st.caption("단위: Qty (RM units)  ※ 단위 혼합 가능(물/L, 설탕/KG 등) — 현재는 동일 단위로 가정")
 
     if not has_results:
         st.info("먼저 '실행'을 눌러서 FG_need와 RM 계산을 만들어줘.")
@@ -407,10 +460,17 @@ with tab2:
             "rm_net_req", "coverage_ratio"
         ]].copy()
 
-        st.dataframe(rm_table_display.head(top_n_rm_table), use_container_width=True)
+        rm_table_display_disp = df_with_commas(
+            rm_table_display,
+            float_cols=["rm_gross_req", "rm_available", "on_hand", "on_order", "rm_net_req"],
+            pct_cols=["coverage_ratio"],
+            float_decimals=3,
+            pct_decimals=1
+        )
+        st.dataframe(rm_table_display_disp.head(top_n_rm_table), use_container_width=True)
 
         with st.expander("전체 RM 테이블 보기"):
-            st.dataframe(rm_table_display, use_container_width=True)
+            st.dataframe(rm_table_display_disp, use_container_width=True)
 
         st.subheader("🧩 RM 카테고리별 보기")
         cats = ["All"] + sorted(rm_out["rm_category"].unique().tolist())
@@ -424,9 +484,14 @@ with tab2:
             "rm_sku", "rm_category",
             "rm_gross_req", "rm_available",
             "rm_net_req"
-        ]].sort_values("rm_net_req", ascending=False)
+        ]].sort_values("rm_net_req", ascending=False).copy()
 
-        st.dataframe(rm_cat_disp, use_container_width=True)
+        rm_cat_disp_fmt = df_with_commas(
+            rm_cat_disp,
+            float_cols=["rm_gross_req", "rm_available", "rm_net_req"],
+            float_decimals=3
+        )
+        st.dataframe(rm_cat_disp_fmt, use_container_width=True)
 
         st.divider()
         st.subheader("🔎 RM 하나 선택 → 어떤 FG 때문에 필요한지 (기여도)")
@@ -444,11 +509,15 @@ with tab2:
                 .sum()
                 .sort_values("fg_contrib_qty", ascending=False)
             )
-            total = fg_contrib["fg_contrib_qty"].sum()
+            total = float(fg_contrib["fg_contrib_qty"].sum())
             fg_contrib["share"] = np.where(total > 0, fg_contrib["fg_contrib_qty"] / total, np.nan)
 
-            st.write(f"선택 RM: **{selected_rm}** | 총 소요량(gross): **{total:.2f} (RM units)**")
-            st.dataframe(fg_contrib.head(top_n_contrib), use_container_width=True)
+            st.write(f"선택 RM: **{selected_rm}** | 총 소요량(gross): **{total:,.3f}**")
+
+            fg_contrib_disp = fg_contrib.copy()
+            fg_contrib_disp["fg_contrib_qty"] = fg_contrib_disp["fg_contrib_qty"].apply(lambda v: fmt_float_commas(v, decimals=3))
+            fg_contrib_disp["share"] = fg_contrib_disp["share"].apply(lambda v: fmt_percent(v, decimals=1))
+            st.dataframe(fg_contrib_disp.head(top_n_contrib), use_container_width=True)
 
             plot_c = fg_contrib.head(top_n_contrib).copy()
             figc = plt.figure(figsize=(14, 5))
@@ -465,7 +534,6 @@ with tab2:
 # =========================
 with tab3:
     st.subheader("3) ABC 분석 (예측월)")
-    st.caption("기준: forecast_value = forecast_sales_qty × unit_price | 단위: KRW")
 
     if not has_results:
         st.info("먼저 '실행'을 눌러 예측 수량을 만든 뒤 ABC를 계산해줘.")
@@ -498,7 +566,7 @@ with tab3:
                 st.error("unit_price가 매칭된 SKU가 없어 ABC 계산이 불가해.")
             else:
                 abc = abc.sort_values("forecast_value", ascending=False).reset_index(drop=True)
-                total_value = abc["forecast_value"].sum()
+                total_value = float(abc["forecast_value"].sum())
                 abc["value_share"] = np.where(total_value > 0, abc["forecast_value"] / total_value, np.nan)
                 abc["cum_share"] = abc["value_share"].cumsum()
 
@@ -516,9 +584,15 @@ with tab3:
                     "month", "sku", "forecast_sales_qty", "unit_price",
                     "forecast_value", "cum_share", "abc_class"
                 ]].copy()
-                st.dataframe(show_abc, use_container_width=True)
 
-                st.subheader("📈 ABC 파레토 (x=SKU, y=예측매출 KRW)")
+                show_abc_disp = show_abc.copy()
+                show_abc_disp["forecast_sales_qty"] = show_abc_disp["forecast_sales_qty"].apply(fmt_int_commas)
+                show_abc_disp["unit_price"] = show_abc_disp["unit_price"].apply(fmt_int_commas)
+                show_abc_disp["forecast_value"] = show_abc_disp["forecast_value"].apply(fmt_int_commas)
+                show_abc_disp["cum_share"] = show_abc_disp["cum_share"].apply(lambda v: fmt_percent(v, decimals=2))
+                st.dataframe(show_abc_disp, use_container_width=True)
+
+                st.subheader("📈 ABC 파레토 (x=SKU, y=예측매출)")
                 plot_abc = abc.head(abc_top_n).copy()
 
                 x = np.arange(len(plot_abc))
