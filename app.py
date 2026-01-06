@@ -15,6 +15,15 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="Inventory Planning (LSTM)", layout="wide")
 st.title("📦 자재소요계획(with LSTM): 필요 재고 분석 → RM 소요계획 → ABC 분석을 통한 구매 우선 순위")
 
+st.markdown("""
+**목적:** 월별 수요 변동을 반영해 *이번 달에 필요한 원재료만* 근거 있게 산출하고, 과잉재고·결품을 줄입니다.  
+**방법:** LSTM으로 SKU별 판매량을 예측 → FG 생산 필요량 계산 → BOM 정전개로 RM 순소요량(구매 필요량) 산출 → ABC 분석으로 중요 SKU를 우선 파악합니다.  
+**효과:** 구매 의사결정 정확도 향상, 재고비용 절감, 자동화로 업무시간 단축 및 보고 편의성 개선.
+""")
+
+st.divider()
+
+
 # =========================
 # Formatting helpers (display-only)
 # =========================
@@ -619,5 +628,6 @@ with tab3:
                     st.metric("B 개수", int((abc["abc_class"] == "B").sum()))
                 with col3:
                     st.metric("C 개수", int((abc["abc_class"] == "C").sum()))
+
 
 
