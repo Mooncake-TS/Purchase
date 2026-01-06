@@ -11,9 +11,8 @@ import matplotlib.pyplot as plt
 # =========================
 # Page
 # =========================
-st.set_page_config(page_title="Forecast vs ERP Inventory (LSTM)", layout="wide")
-st.title("📦 월 입력 → 전체 SKU 예측(LSTM) → ERP 재고 비교")
-st.caption("루트에 sales.xlsx / inventory.xlsx 필요 (month, sku, sales_qty) / (sku, on_hand, on_order)")
+st.set_page_config(page_title="Inventory Planning (LSTM)", layout="wide")
+st.title("📦 Inventory Planning: 수량 분석 → 원재료 구매")
 
 # =========================
 # Data Load (ROOT)
@@ -43,9 +42,23 @@ def load_inventory_root() -> pd.DataFrame:
 
     inv = inv.copy()
     inv["sku"] = inv["sku"].astype(str)
-    inv["on_hand"] = pd.to_numeric(inv["on_hand"], errors="coerce").fillna(0).astype(int)
-    inv["on_order"] = pd.to_numeric(inv["on_order"], errors="coerce").fillna(0).astype(int)
+    inv["on_hand"] = pd.to_numeric(inv["on_hand"], errors="coerce").fillna(0).astype(float)
+    inv["on_order"] = pd.to_numeric(inv["on_order"], errors="coerce").fillna(0).astype(float)
     return inv
+
+@st.cache_data
+def load_bom_root() -> pd.DataFrame:
+    bom = pd.read_excel("BOM.xlsx")
+    required = {"fg_sku", "rm_sku", "qty_per"}
+    missing = required - set(bom.columns)
+    if missing:
+        raise ValueError(f"BOM.xlsx에 컬럼이 부족해: {missing}")
+
+    bom = bom.copy()
+    bom["fg_sku"] = bom["fg_sku"].astype(str)
+    bom["rm_sku"] = bom["rm_sku"].astype(str)
+    bom["qty_per"] = pd.to_numeric(bom["qty_per"], errors="coerce").fillna(0.0)
+    return bom
 
 def make_monthly_series(df: pd.DataFrame, sku: str) -> pd.Series:
     s = (
@@ -83,8 +96,7 @@ def build_model(window: int, lstm_units: int = 32):
 @st.cache_resource
 def train_lstm_cached(series_values_tuple, window: int, epochs: int, batch_size: int, seed: int):
     """
-    SKU별 모델 학습을 캐시해서 같은 설정으로 재실행 시 시간을 크게 줄임.
-    series_values_tuple: 캐시 키 안정화를 위한 튜플 입력
+    SKU별 모델 학습 캐시: 같은 설정으로 다시 실행하면 학습 시간 크게 단축.
     """
     series_values = np.array(series_values_tuple, dtype=float).reshape(-1, 1)
 
@@ -96,10 +108,7 @@ def train_lstm_cached(series_values_tuple, window: int, epochs: int, batch_size:
 
     X, y = make_sequences(scaled, window)
     if len(X) < 10:
-        raise ValueError(
-            f"학습 샘플이 너무 적어: {len(X)}개 (window={window}). "
-            f"window를 줄이거나 데이터 기간을 늘려줘."
-        )
+        raise ValueError(f"학습 샘플이 너무 적어: {len(X)}개 (window={window})")
 
     split = int(len(X) * 0.8)
     X_train, y_train = X[:split], y[:split]
@@ -121,13 +130,12 @@ def train_lstm_cached(series_values_tuple, window: int, epochs: int, batch_size:
         callbacks=[cb],
         verbose=0
     )
-
     return model, scaler, scaled
 
 def forecast_to_target_month(model, scaler, scaled_history: np.ndarray, window: int,
                              last_month: pd.Timestamp, target_ym: str) -> int:
     """
-    마지막 관측월 다음달부터 target_ym까지 재귀 예측 → target_ym 예측값(int) 반환
+    마지막 관측월 다음달부터 target_ym까지 재귀 예측 → target_ym 예측값(int)
     """
     target = pd.to_datetime(target_ym + "-01")
 
@@ -149,23 +157,19 @@ def forecast_to_target_month(model, scaler, scaled_history: np.ndarray, window: 
         p_sc = float(model.predict(lw, verbose=0)[0, 0])
         p_qty = float(scaler.inverse_transform([[p_sc]])[0, 0])
         pred_int = max(0, int(round(p_qty)))
-        work = np.vstack([work, [[p_sc]]])  # 다음 step을 위해 누적
+        work = np.vstack([work, [[p_sc]]])
 
     return pred_int
 
 # =========================
-# Load data
+# Load files
 # =========================
 try:
     df_sales = load_sales_root()
-except Exception as e:
-    st.error(f"❌ sales.xlsx 로드 실패: {e}")
-    st.stop()
-
-try:
     df_inv = load_inventory_root()
+    df_bom = load_bom_root()
 except Exception as e:
-    st.error(f"❌ inventory.xlsx 로드 실패: {e}")
+    st.error(f"❌ 파일 로드 실패: {e}")
     st.stop()
 
 skus = sorted(df_sales["sku"].unique().tolist())
@@ -173,35 +177,42 @@ global_last_month = df_sales["month"].max()
 default_target = (global_last_month + pd.offsets.MonthBegin(1)).strftime("%Y-%m")
 
 # =========================
-# Sidebar controls
+# Sidebar
 # =========================
 with st.sidebar:
-    st.header("설정")
+    st.header("공통 설정")
     target_ym = st.text_input("예측 대상 월 (YYYY-MM)", value=default_target)
     window = st.slider("입력 윈도우(개월)", 3, 24, 12)
-    epochs = st.slider("학습 epochs", 50, 300, 100, step=50)  # 기본 빠르게
+    epochs = st.slider("학습 epochs", 50, 300, 100, step=50)
     batch_size = st.selectbox("batch size", [4, 8, 16, 32], index=1)
     seed = st.number_input("random seed", min_value=0, max_value=9999, value=42, step=1)
-    top_n = st.slider("그래프 Top N", 5, len(skus), min(20, len(skus)))
-    show_all_table = st.checkbox("전체 비교 테이블도 펼쳐서 보기", value=False)
 
-st.write(f"📌 현재 데이터 마지막 월: **{global_last_month.strftime('%Y-%m')}**")
-st.write(f"📌 기본 예측월: **{default_target}**")
+    top_n_fg = st.slider("FG 그래프 Top N", 5, len(skus), min(20, len(skus)))
+    top_n_rm = st.slider("RM 그래프 Top N", 5, 50, 20)
 
-run = st.button("🚀 예측 & ERP 비교 실행")
+    st.divider()
+    st.caption("정의(합의한 룰)")
+    st.caption("- FG on_order = WIP (생산중/완성 예정)")
+    st.caption("- RM on_order = 발주/운송중(입고 예정)")
 
 # =========================
-# Run
+# Run button
 # =========================
+run = st.button("🚀 실행")
+
+# =========================
+# Tabs
+# =========================
+tab1, tab2 = st.tabs(["1) 수량 분석 (FG)", "2) 원재료 구매 (RM)"])
+
 if run:
+    # ---------- Forecast all SKUs ----------
     results = []
     progress = st.progress(0)
     status = st.empty()
 
-    # --- Forecast all SKUs ---
     for i, sku in enumerate(skus, start=1):
-        status.write(f"LSTM 학습/예측 중: {sku} ({i}/{len(skus)})")
-
+        status.write(f"LSTM 예측 중: {sku} ({i}/{len(skus)})")
         try:
             series = make_monthly_series(df_sales, sku)
             last_month = series.index.max()
@@ -224,19 +235,10 @@ if run:
                 target_ym=target_ym
             )
 
-            results.append({
-                "month": target_ym,
-                "sku": sku,
-                "forecast_sales_qty": int(pred_qty)
-            })
+            results.append({"month": target_ym, "sku": sku, "forecast_sales_qty": int(pred_qty)})
 
         except Exception as e:
-            results.append({
-                "month": target_ym,
-                "sku": sku,
-                "forecast_sales_qty": None,
-                "error": str(e)
-            })
+            results.append({"month": target_ym, "sku": sku, "forecast_sales_qty": None, "error": str(e)})
 
         progress.progress(i / len(skus))
 
@@ -252,91 +254,122 @@ if run:
         st.stop()
 
     out_ok["forecast_sales_qty"] = out_ok["forecast_sales_qty"].astype(int)
-    out_ok = out_ok.sort_values("forecast_sales_qty", ascending=False)
 
-    st.subheader("✅ 예측 결과")
-    st.dataframe(out_ok, use_container_width=True)
+    # ---------- FG compare: fg_available = on_hand + on_order(WIP) ----------
+    inv_fg = df_inv.copy()  # FG/RM 섞여 있어도 sku로만 merge하면 됨
+    cmp_fg = out_ok.merge(inv_fg, on="sku", how="left")
+    cmp_fg["on_hand"] = cmp_fg["on_hand"].fillna(0)
+    cmp_fg["on_order"] = cmp_fg["on_order"].fillna(0)
 
-    # --- Compare with ERP inventory ---
-    cmp = out_ok.merge(df_inv, on="sku", how="left")
-    cmp["on_hand"] = cmp["on_hand"].fillna(0).astype(int)
-    cmp["on_order"] = cmp["on_order"].fillna(0).astype(int)
-    cmp["available_qty"] = cmp["on_hand"] + cmp["on_order"]
-    cmp["shortage_qty"] = (cmp["forecast_sales_qty"] - cmp["available_qty"]).clip(lower=0).astype(int)
+    cmp_fg["fg_available_qty"] = cmp_fg["on_hand"] + cmp_fg["on_order"]  # ✅ on_order를 WIP로 사용
+    cmp_fg["fg_need_qty"] = (cmp_fg["forecast_sales_qty"] - cmp_fg["fg_available_qty"]).clip(lower=0)
 
-    cmp = cmp[[
-        "month", "sku",
-        "forecast_sales_qty",
-        "on_hand", "on_order", "available_qty",
-        "shortage_qty"
-    ]].sort_values("shortage_qty", ascending=False)
+    # float 가능(원하면 int로 바꿔도 됨)
+    cmp_fg["fg_need_qty"] = cmp_fg["fg_need_qty"].round(0).astype(int)
 
-    # =========================
-    # Graph 1: Forecast by SKU (Top N)
-    # =========================
-    st.subheader("📊 SKU별 예측 판매량 (Top N)")
-    plot_f = out_ok.head(top_n).copy().sort_values("forecast_sales_qty", ascending=False)
+    # ============================================================
+    # TAB 1: 수량 분석 (FG)
+    # ============================================================
+    with tab1:
+        st.subheader("✅ 예측 결과 (전체 SKU)")
+        st.dataframe(out_ok.sort_values("forecast_sales_qty", ascending=False), use_container_width=True)
 
-    fig1 = plt.figure(figsize=(14, 5))
-    plt.bar(plot_f["sku"], plot_f["forecast_sales_qty"])
-    plt.xlabel("SKU")
-    plt.ylabel("Forecast Sales Qty")
-    plt.title(f"Top {top_n} SKU Forecast - {target_ym}")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-    st.pyplot(fig1)
+        st.subheader("🏭 FG: 예측 vs (재고 + WIP) 비교 → 생산 필요량")
+        show_fg = cmp_fg[["sku", "forecast_sales_qty", "on_hand", "on_order", "fg_available_qty", "fg_need_qty"]].copy()
+        show_fg = show_fg.sort_values("fg_need_qty", ascending=False)
+        st.dataframe(show_fg, use_container_width=True)
 
-    # =========================
-    # Graph 2: Forecast vs Available (Top N)
-    # =========================
-    st.subheader("📊 SKU별 예측 vs 가용재고(ERP) 비교 (Top N)")
+        st.subheader("📊 FG: 예측 vs 가용재고(재고+WIP) (Top N)")
+        plot_fg = show_fg.sort_values("forecast_sales_qty", ascending=False).head(top_n_fg).copy()
 
-    cmp_plot = cmp.copy()
-    # 비교 그래프는 예측이 큰 SKU 위주로 보여주는 게 보통 더 직관적
-    cmp_plot = cmp_plot.sort_values("forecast_sales_qty", ascending=False).head(top_n)
+        x = np.arange(len(plot_fg))
+        width = 0.42
+        fig1 = plt.figure(figsize=(14, 5))
+        plt.bar(x - width/2, plot_fg["forecast_sales_qty"], width=width, label="Forecast")
+        plt.bar(x + width/2, plot_fg["fg_available_qty"], width=width, label="FG Available (On hand + WIP)")
+        plt.xticks(x, plot_fg["sku"], rotation=45, ha="right")
+        plt.xlabel("FG SKU")
+        plt.ylabel("Qty")
+        plt.title(f"Forecast vs FG Available - {target_ym} (Top {top_n_fg})")
+        plt.legend()
+        plt.tight_layout()
+        st.pyplot(fig1)
 
-    x = np.arange(len(cmp_plot))
-    width = 0.42
+        st.subheader("🧾 생산 필요 SKU만")
+        fg_need_only = show_fg[show_fg["fg_need_qty"] > 0].copy()
+        if len(fg_need_only) == 0:
+            st.success("🎉 생산 필요 SKU가 없어! (예측 대비 재고+WIP가 충분)")
+        else:
+            st.dataframe(fg_need_only, use_container_width=True)
 
-    fig2 = plt.figure(figsize=(14, 5))
-    plt.bar(x - width/2, cmp_plot["forecast_sales_qty"], width=width, label="Forecast")
-    plt.bar(x + width/2, cmp_plot["available_qty"], width=width, label="Available (On hand + On order)")
-    plt.xticks(x, cmp_plot["sku"], rotation=45, ha="right")
-    plt.xlabel("SKU")
-    plt.ylabel("Qty")
-    plt.title(f"Forecast vs Available - {target_ym} (Top {top_n})")
-    plt.legend()
-    plt.tight_layout()
-    st.pyplot(fig2)
+        if len(out_err) > 0:
+            with st.expander("⚠️ 예측 실패 SKU (원인)"):
+                st.dataframe(out_err, use_container_width=True)
 
-    # =========================
-    # Table: Shortage only
-    # =========================
-    st.subheader("🧾 부족 수량 테이블 (Shortage > 0)")
-    shortage_table = cmp[cmp["shortage_qty"] > 0].copy()
+    # ============================================================
+    # TAB 2: 원재료 구매 (RM)  ← 너가 원하는 핵심: '원재료 부족량 그래프 1개'
+    # ============================================================
+    with tab2:
+        st.subheader("🧪 원재료 부족량 그래프 (이번 달 구매해야 할 원재료)")
 
-    if len(shortage_table) == 0:
-        st.success("🎉 부족 SKU가 없어! 예측 대비 재고/입고예정이 충분해.")
-    else:
-        st.dataframe(shortage_table, use_container_width=True)
+        fg_need = cmp_fg[["sku", "fg_need_qty"]].rename(columns={"sku": "fg_sku"}).copy()
+        fg_need = fg_need[fg_need["fg_need_qty"] > 0]
 
-    # 전체 테이블 옵션
-    if show_all_table:
-        st.subheader("📋 전체 비교 테이블 (Forecast vs ERP)")
-        st.dataframe(cmp, use_container_width=True)
+        if len(fg_need) == 0:
+            st.info("생산 필요량이 0이라 원재료 구매도 필요 없어.")
+        else:
+            # BOM explode
+            exp = fg_need.merge(df_bom, on="fg_sku", how="left")
+            missing_bom = exp[exp["rm_sku"].isna()]["fg_sku"].unique().tolist()
+            if missing_bom:
+                st.warning(f"BOM이 없는 FG가 있어 정전개에서 제외됨: {missing_bom}")
 
-    # 다운로드
-    st.subheader("⬇️ 결과 다운로드")
-    csv_cmp = cmp.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "Forecast vs ERP 비교 결과 CSV 다운로드",
-        data=csv_cmp,
-        file_name=f"forecast_vs_erp_{target_ym}.csv",
-        mime="text/csv"
-    )
+            exp = exp.dropna(subset=["rm_sku"]).copy()
+            exp["rm_gross_req"] = exp["fg_need_qty"] * exp["qty_per"]
 
-    if len(out_err) > 0:
-        with st.expander("⚠️ 예측 실패 SKU (원인)"):
-            st.dataframe(out_err, use_container_width=True)
+            rm_gross = exp.groupby("rm_sku", as_index=False)["rm_gross_req"].sum()
+            rm_gross = rm_gross.sort_values("rm_gross_req", ascending=False)
 
-    st.success(f"완료! 선택 월: {target_ym}")
+            # RM inventory join (on_hand + on_order = available)
+            rm = rm_gross.merge(df_inv, left_on="rm_sku", right_on="sku", how="left")
+            rm["on_hand"] = rm["on_hand"].fillna(0)
+            rm["on_order"] = rm["on_order"].fillna(0)
+            rm["rm_available"] = rm["on_hand"] + rm["on_order"]
+
+            # net requirement (shortage) = 구매 필요량
+            rm["rm_net_req"] = (rm["rm_gross_req"] - rm["rm_available"]).clip(lower=0)
+
+            # 보기 좋은 정리
+            rm_out = rm[["rm_sku", "rm_gross_req", "on_hand", "on_order", "rm_available", "rm_net_req"]].copy()
+            rm_out = rm_out.sort_values("rm_net_req", ascending=False)
+
+            # 부족만 남기기
+            rm_short = rm_out[rm_out["rm_net_req"] > 0].copy()
+
+            if len(rm_short) == 0:
+                st.success("🎉 원재료가 충분해! (총소요량 대비 재고+입고예정이 커버)")
+                st.dataframe(rm_out, use_container_width=True)
+            else:
+                # ✅ 너가 원한 '원재료 부족량' 단일 그래프
+                plot_rm = rm_short.head(top_n_rm).copy()
+
+                fig2 = plt.figure(figsize=(14, 5))
+                plt.bar(plot_rm["rm_sku"], plot_rm["rm_net_req"])
+                plt.xlabel("RM SKU")
+                plt.ylabel("Net Requirement (Purchase Qty)")
+                plt.title(f"RM Net Requirement (Purchase Needed) - {target_ym} (Top {min(top_n_rm, len(plot_rm))})")
+                plt.xticks(rotation=45, ha="right")
+                plt.tight_layout()
+                st.pyplot(fig2)
+
+                st.subheader("🧾 원재료 부족 목록 (구매 필요)")
+                st.dataframe(rm_short, use_container_width=True)
+
+                # 다운로드
+                csv_rm = rm_short.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "원재료 구매 필요량 CSV 다운로드",
+                    data=csv_rm,
+                    file_name=f"rm_purchase_{target_ym}.csv",
+                    mime="text/csv"
+                )
